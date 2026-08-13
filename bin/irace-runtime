@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MANIFEST="$ROOT/runtime/pixi.toml"
+LOCKFILE="$ROOT/runtime/pixi.lock"
+VERSION_FILE="$ROOT/VERSION"
+PIXI_VERSION_FILE="$ROOT/bootstrap/PIXI_VERSION"
+PIXI_CHECKSUM_FILE="$ROOT/bootstrap/pixi-linux-x86_64.sha256"
+
+PIXI=""
+PIXI_SOURCE=""
+
+error() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  irace-runtime check
+  irace-runtime install
+  irace-runtime run [irace args...]
+  irace-runtime exec <command> [args...]
+EOF
+}
+
+read_value() {
+    local file=$1 value
+    IFS= read -r value < "$file" || true
+    [[ -n "$value" ]] || error "empty required file: $file"
+    printf '%s\n' "$value"
+}
+
+check_platform() {
+    local os arch
+    os=$(uname -s)
+    arch=$(uname -m)
+    if [[ "$os" != "Linux" || "$arch" != "x86_64" ]]; then
+        error "irace-runtime MVP supports linux-x86_64 only. Detected: $os $arch"
+    fi
+}
+
+ensure_bootstrap_pixi() {
+    local version target_dir target archive extract_dir url expected actual
+    version=$(read_value "$PIXI_VERSION_FILE")
+    target_dir="$ROOT/.runtime/pixi/$version"
+    target="$target_dir/pixi"
+
+    if [[ -x "$target" ]]; then
+        printf '%s\n' "$target"
+        return
+    fi
+
+    command -v sha256sum >/dev/null 2>&1 || error "sha256sum is required to bootstrap Pixi"
+    command -v tar >/dev/null 2>&1 || error "tar is required to bootstrap Pixi"
+    mkdir -p "$target_dir"
+    archive="$target_dir/pixi.tar.gz.tmp.$$"
+    extract_dir="$target_dir/extract.tmp.$$"
+    url="https://github.com/prefix-dev/pixi/releases/download/v${version}/pixi-x86_64-unknown-linux-musl.tar.gz"
+
+    printf 'Downloading private Pixi %s...\n' "$version" >&2
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --location --silent --show-error --output "$archive" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --quiet --output-document="$archive" "$url"
+    else
+        error "curl or wget is required to bootstrap Pixi"
+    fi
+
+    printf 'Verifying checksum...\n' >&2
+    expected=$(awk 'NR == 1 { print $1 }' "$PIXI_CHECKSUM_FILE")
+    actual=$(sha256sum "$archive" | awk '{ print $1 }')
+    if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+        rm -f "$archive"
+        error "Pixi checksum mismatch (expected $expected, got $actual)"
+    fi
+
+    mkdir -p "$extract_dir"
+    tar -xzf "$archive" -C "$extract_dir"
+    [[ -f "$extract_dir/pixi" ]] || error "Pixi archive did not contain a pixi binary"
+    chmod +x "$extract_dir/pixi"
+    mv -f "$extract_dir/pixi" "$target"
+    rm -f "$archive"
+    rmdir "$extract_dir"
+    printf '%s\n' "$target"
+}
+
+find_pixi() {
+    if [[ -n "${IRACE_RUNTIME_PIXI:-}" ]]; then
+        [[ -x "$IRACE_RUNTIME_PIXI" ]] || error "IRACE_RUNTIME_PIXI is not executable: $IRACE_RUNTIME_PIXI"
+        PIXI="$IRACE_RUNTIME_PIXI"
+        PIXI_SOURCE="environment"
+    elif command -v pixi >/dev/null 2>&1; then
+        PIXI=$(command -v pixi)
+        PIXI_SOURCE="system"
+    else
+        PIXI=$(ensure_bootstrap_pixi)
+        PIXI_SOURCE="bootstrap"
+    fi
+}
+
+ensure_runtime() {
+    printf 'Installing locked irace environment...\n' >&2
+    "$PIXI" install --locked --manifest-path "$MANIFEST"
+}
+
+pixi_run() {
+    "$PIXI" run --locked --manifest-path "$MANIFEST" "$@"
+}
+
+cmd_install() {
+    [[ $# -eq 0 ]] || error "install takes no arguments"
+    find_pixi
+    ensure_runtime
+}
+
+cmd_check() {
+    local runtime_version pixi_version r_version irace_version
+    [[ $# -eq 0 ]] || error "check takes no arguments"
+    find_pixi
+    ensure_runtime
+
+    runtime_version=$(read_value "$VERSION_FILE")
+    pixi_version=$("$PIXI" --version | awk '{ print $NF }')
+    r_version=$(pixi_run Rscript -e 'cat(as.character(getRversion()))')
+    irace_version=$(pixi_run Rscript -e 'cat(as.character(packageVersion("irace")))')
+
+    cat <<EOF
+irace-runtime $runtime_version
+
+platform
+  os:         linux
+  arch:       x86_64
+
+pixi
+  source:     $PIXI_SOURCE
+  executable: $PIXI
+  version:    $pixi_version
+
+runtime
+  manifest:   $MANIFEST
+  lockfile:   $LOCKFILE
+  installed:  yes
+
+R
+  version:    $r_version
+
+irace
+  version:    $irace_version
+
+status: OK
+EOF
+}
+
+cmd_run() {
+    find_pixi
+    ensure_runtime
+    exec "$PIXI" run --locked --manifest-path "$MANIFEST" irace "$@"
+}
+
+cmd_exec() {
+    [[ $# -gt 0 ]] || error "exec requires a command"
+    find_pixi
+    ensure_runtime
+    exec "$PIXI" run --locked --manifest-path "$MANIFEST" "$@"
+}
+
+check_platform
+[[ -f "$MANIFEST" ]] || error "missing manifest: $MANIFEST"
+[[ -f "$LOCKFILE" ]] || error "missing lockfile: $LOCKFILE"
+
+case "${1:-}" in
+    check)
+        shift
+        cmd_check "$@"
+        ;;
+    install)
+        shift
+        cmd_install "$@"
+        ;;
+    run)
+        shift
+        cmd_run "$@"
+        ;;
+    exec)
+        shift
+        cmd_exec "$@"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
