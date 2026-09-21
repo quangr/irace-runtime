@@ -5,9 +5,8 @@ platforms = ["linux-64"]
 
 [dependencies]
 r-base = "*"
-r-irace = "==4.4.3"
+r-irace = "==4.4.4"
 
 [tasks]
 # conda-forge installs the irace CLI inside R's package library.
 irace = "$CONDA_PREFIX/lib/R/library/irace/bin/irace"
-
